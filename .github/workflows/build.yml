@@ -1,0 +1,109 @@
+name: Check Upstream and Build Binary
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Запуск каждый день в 03:00 UTC
+  workflow_dispatch: # Возможность ручного запуска
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Получаем хэш последнего коммита из оригинального репозитория
+      - name: Get upstream latest commit
+        id: upstream
+        run: |
+          SHA=$(git ls-remote https://github.com/cristipufu/tunnelite.git HEAD | awk '{print $1}')
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      # 2. Проверяем кэш
+      - name: Check cache for this commit
+        id: cache-check
+        uses: actions/cache@v4
+        with:
+          path: ./built-binary
+          key: tunnelite-${{ steps.upstream.outputs.sha }}
+
+      # 3. Клонируем апстрим, если кэш пуст
+      - name: Checkout upstream
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 'cristipufu/tunnelite'
+          fetch-depth: 1
+
+      # 4. Настраиваем окружение .NET SDK
+      - name: Setup .NET
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # 5. Поиск исполняемого проекта и сборка в плоскую структуру ./publish
+      - name: Publish Single File Binary
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        run: |
+          # Ищем проект, который является исполняемым (содержит OutputType Exe или PackAsTool)
+          PROJECT_PATH=$(grep -rEl "<OutputType>Exe</OutputType>|<PackAsTool>true</PackAsTool>" --include="*.csproj" . | head -n 1)
+          
+          if [ -z "$PROJECT_PATH" ]; then
+            echo "Error: Executable project (*.csproj) not found!"
+            exit 1
+          fi
+          
+          echo "Found executable project at: $PROJECT_PATH"
+          
+          # Публикуем выбранный исполняемый проект
+          dotnet publish "$PROJECT_PATH" -c Release -r linux-x64 --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishReadyToRun=true \
+            -p:EnableCompressionInSingleFile=true \
+            -o ./publish
+
+      # 6. Динамическое определение имени бинарника и его переименование
+      - name: Prepare binary for cache/release
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./built-binary
+          
+          # Извлекаем имя проекта из пути (например, "Tunnelite.Client")
+          PROJECT_PATH=$(grep -rEl "<OutputType>Exe</OutputType>|<PackAsTool>true</PackAsTool>" --include="*.csproj" . | head -n 1)
+          PROJECT_NAME=$(basename "$PROJECT_PATH" .csproj)
+          echo "Looking for compiled binary: $PROJECT_NAME in ./publish/"
+          
+          # Проверяем варианты имени файла (с учетом регистра) и копируем как 'tunnelite'
+          if [ -f "./publish/$PROJECT_NAME" ]; then
+            cp "./publish/$PROJECT_NAME" ./built-binary/tunnelite
+          elif [ -f "./publish/$(echo $PROJECT_NAME | tr '[:upper:]' '[:lower:]')" ]; then
+            cp "./publish/$(echo $PROJECT_NAME | tr '[:upper:]' '[:lower:]')" ./built-binary/tunnelite
+          else
+            # Запасной вариант: берем первый файл из публикации без расширений .dll/.pdb/.json
+            ALT_BIN=$(find ./publish -maxdepth 1 -type f -not -name "*.dll" -not -name "*.pdb" -not -name "*.json" -not -name "*.config" | head -n 1)
+            if [ -n "$ALT_BIN" ]; then
+              cp "$ALT_BIN" ./built-binary/tunnelite
+            else
+              echo "Error: Compiled binary not found in ./publish/"
+              exit 1
+            fi
+          fi
+          
+          # Делаем файл исполняемым
+          chmod +x ./built-binary/tunnelite
+          echo "Binary successfully prepared for release."
+          ls -l ./built-binary/
+
+      # 7. Загрузка в релизы GitHub
+      - name: Upload to Release
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Automated Build"
+          body: "Автоматическая сборка на основе коммита ${{ steps.upstream.outputs.sha }}"
+          files: ./built-binary/tunnelite
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
